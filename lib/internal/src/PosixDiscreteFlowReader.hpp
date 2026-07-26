@@ -27,6 +27,26 @@ namespace mxl::lib
          */
         PosixDiscreteFlowReader(FlowManager const& manager, uuids::uuid const& flowId, std::unique_ptr<DiscreteFlowData>&& data);
 
+        /**
+         * Closes the flow access file descriptor opened by the constructor.
+         *
+         * Without this the descriptor leaked once per reader: a consumer that
+         * reattaches after the writer rolls the ring creates a fresh reader on
+         * every retry, so a flow whose writer is down leaks ~1 fd/second
+         * indefinitely (observed: a switcher at 7256 open fds, 3992 of them on
+         * already-unlinked ring directories).
+         *
+         * Non-copyable and non-movable: the class owns a raw descriptor and is
+         * only ever built through PosixFlowIoFactory as a unique_ptr, so
+         * suppressing the implicit move is free and prevents a double close.
+         */
+        ~PosixDiscreteFlowReader() override;
+
+        PosixDiscreteFlowReader(PosixDiscreteFlowReader const&) = delete;
+        PosixDiscreteFlowReader& operator=(PosixDiscreteFlowReader const&) = delete;
+        PosixDiscreteFlowReader(PosixDiscreteFlowReader&&) = delete;
+        PosixDiscreteFlowReader& operator=(PosixDiscreteFlowReader&&) = delete;
+
         /** \see FlowReader::getFlowData */
         [[nodiscard]]
         virtual FlowData const& getFlowData() const override;

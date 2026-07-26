@@ -43,11 +43,23 @@ namespace mxl::lib
         , _accessFileFd{-1}
     {
         auto const accessFile = makeFlowAccessFilePath(manager.getDomain(), to_string(flowId));
-        _accessFileFd = ::open(accessFile.string().c_str(), O_RDWR);
+        // O_CLOEXEC: a reader descriptor must not survive into a forked child's
+        // exec'd image, which would pin the (possibly already unlinked) ring
+        // directory for the lifetime of that process.
+        _accessFileFd = ::open(accessFile.string().c_str(), O_RDWR | O_CLOEXEC);
 
         // Opening the access file may fail if the domain is in a read only volume.
         // we can still execute properly but the 'lastReadTime' will never be updated.
         // Ignore failures.
+    }
+
+    PosixDiscreteFlowReader::~PosixDiscreteFlowReader()
+    {
+        if (_accessFileFd >= 0)
+        {
+            (void)::close(_accessFileFd);
+            _accessFileFd = -1;
+        }
     }
 
     FlowData const& PosixDiscreteFlowReader::getFlowData() const
