@@ -5,6 +5,7 @@
 #pragma once
 
 #include "AudioBounceBuffer.hpp"
+#include <cstdint>
 #include "DataLayout.hpp"
 #include "Protocol.hpp"
 
@@ -60,6 +61,11 @@ namespace mxl::lib::fabrics::ofi
         std::vector<Region> _regions;
         bool _isMemoryRegistered{false};
         std::optional<Target::ImmediateDataLocation> _immDataBuffer{};
+        /// Completions received with no immediate data, and therefore no ring slot
+        /// or slice index — such grains cannot be placed and are dropped. Counted
+        /// and logged so a provider that does not carry remote CQ data is visible
+        /// rather than presenting as a healthy, idle endpoint.
+        std::uint64_t _droppedNoImmData{0};
     };
 
     /** \brief Ingress protocol for RMA writer endpoint for audio samples.
@@ -119,5 +125,7 @@ namespace mxl::lib::fabrics::ofi
         Region _region;
         bool _isMemoryRegistered = false;
         std::optional<Target::ImmediateDataLocation> _immDataBuffer{};
+        /// See RMAGrainIngressProtocol::_droppedNoImmData.
+        std::uint64_t _droppedNoImmData{0};
     };
 }

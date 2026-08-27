@@ -276,7 +276,10 @@ namespace mxl::lib::fabrics::ofi
             throw Exception::make(MXL_ERR_NO_FABRIC, "No provider available");
         }
 
-        uint64_t caps = FI_RMA | FI_WRITE | FI_REMOTE_WRITE;
+        // FI_REMOTE_CQ_DATA must be requested at fi_getinfo time, not merely set
+        // as a flag on fi_writemsg (Endpoint::writeImpl). A provider is only
+        // obliged to carry immediate data if the capability was negotiated here.
+        uint64_t caps = FI_RMA | FI_WRITE | FI_REMOTE_WRITE | FI_REMOTE_CQ_DATA;
         // To enable device memory support:
         // caps |=  FI_HMEM;
         auto fabricInfoList = FabricInfoList::get(config.interface.address.node, config.interface.address.service, provider.value(), caps, FI_EP_MSG);

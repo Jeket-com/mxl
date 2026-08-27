@@ -49,6 +49,19 @@ namespace mxl::lib::fabrics::ofi
         auto completionData = completion.tryData();
         if (!completionData)
         {
+            // A completion with no immediate data carries no ring slot or slice
+            // index, so the grain cannot be placed and is dropped here. This used
+            // to be a bare `return {}`: a provider that does not deliver remote CQ
+            // data discarded 100% of traffic while the endpoint reported
+            // errors:0 and connected:true, which is how the tcp path shipped
+            // "working" and stayed undiagnosed. Never make this silent again.
+            if (++_droppedNoImmData == 1 || (_droppedNoImmData % 1000) == 0)
+            {
+                MXL_WARN("RMAGrainIngressProtocol: completion carried no immediate data; grain dropped "
+                         "(total {}). The provider likely does not support "
+                         "FI_REMOTE_CQ_DATA on RMA writes.",
+                    _droppedNoImmData);
+            }
             return {};
         }
 
@@ -139,6 +152,19 @@ namespace mxl::lib::fabrics::ofi
         auto completionData = completion.tryData();
         if (!completionData)
         {
+            // A completion with no immediate data carries no ring slot or slice
+            // index, so the grain cannot be placed and is dropped here. This used
+            // to be a bare `return {}`: a provider that does not deliver remote CQ
+            // data discarded 100% of traffic while the endpoint reported
+            // errors:0 and connected:true, which is how the tcp path shipped
+            // "working" and stayed undiagnosed. Never make this silent again.
+            if (++_droppedNoImmData == 1 || (_droppedNoImmData % 1000) == 0)
+            {
+                MXL_WARN("RMASampleIngressProtocol: completion carried no immediate data; grain dropped "
+                         "(total {}). The provider likely does not support "
+                         "FI_REMOTE_CQ_DATA on RMA writes.",
+                    _droppedNoImmData);
+            }
             return {};
         }
 
