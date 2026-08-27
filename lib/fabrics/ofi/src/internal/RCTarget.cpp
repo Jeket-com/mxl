@@ -41,7 +41,13 @@ namespace mxl::lib::fabrics::ofi
         }
 
         // Get a list of available fabric configurations available on this machine.
-        std::uint64_t caps = FI_RMA | FI_REMOTE_WRITE;
+        // FI_REMOTE_CQ_DATA is load-bearing, not optional: the ingress protocols
+        // carry the grain's ring slot and slice index ONLY in the RMA write's
+        // immediate data (see ProtocolIngressRMA::read). Requesting it here is
+        // what makes a provider deliver that data. Omitting it worked by luck on
+        // verbs, which carries immediate data regardless, and failed silently on
+        // tcp — connections established and every grain was dropped.
+        std::uint64_t caps = FI_RMA | FI_REMOTE_WRITE | FI_REMOTE_CQ_DATA;
         // To enable device memory support:
         // caps |=  FI_HMEM;
         auto fabricInfoList = FabricInfoList::get(config.interface.address.node, config.interface.address.service, provider.value(), caps, FI_EP_MSG);
