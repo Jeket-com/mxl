@@ -166,14 +166,7 @@ namespace mxl::lib::fabrics::ofi
         /// These are the memory registration modes we currently support
         hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_HMEM;
 
-        // Mode bits declare what provider-imposed requirements THIS application can
-        // satisfy; a provider needing a bit we do not advertise is filtered out of
-        // fi_getinfo's results. We support FI_RX_CQ_DATA — Domain::usingRecvBufForCqData()
-        // reports it and both RMA ingress protocols post a receive buffer for the
-        // immediate data when it is set. Leaving this at 0 silently excluded that
-        // path, so a provider that can only deliver CQ data via a posted buffer
-        // could never be selected, and the fallback was dead code.
-        hints->mode = FI_RX_CQ_DATA;
+        hints->mode = 0;
         hints->caps = caps;
         hints->ep_attr->type = epType;
         hints->fabric_attr->prov_name = strdup(fmt::to_string(provider).c_str());
