@@ -43,11 +43,27 @@ namespace mxl::lib
         , _accessFileFd{-1}
     {
         auto const accessFile = makeFlowAccessFilePath(manager.getDomain(), to_string(flowId));
-        _accessFileFd = ::open(accessFile.string().c_str(), O_RDWR);
+        // O_CLOEXEC: a reader descriptor must not survive into a forked child's
+        // exec'd image, which would pin the (possibly already unlinked) ring
+        // directory for the lifetime of that process (Jeket-com/mxl#1).
+        _accessFileFd = ::open(accessFile.string().c_str(), O_RDWR | O_CLOEXEC);
 
         // Opening the access file may fail if the domain is in a read only volume.
         // we can still execute properly but the 'lastReadTime' will never be updated.
         // Ignore failures.
+    }
+
+    PosixDiscreteFlowReader::~PosixDiscreteFlowReader()
+    {
+        if (_accessFileFd != -1)
+        {
+            if (::close(_accessFileFd) != 0)
+            {
+                auto const error = errno;
+                MXL_ERROR("Failed to close access file fd: {}", ::strerror(error));
+            }
+            _accessFileFd = -1;
+        }
     }
 
     FlowData const& PosixDiscreteFlowReader::getFlowData() const
@@ -154,7 +170,14 @@ namespace mxl::lib
         if (auto const headIndex = flow->info.runtime.headIndex; in_index <= headIndex)
         {
             auto const grainCount = flow->info.config.discrete.grainCount;
-            auto const minIndex = (headIndex >= grainCount) ? (headIndex - grainCount + 1U) : std::uint64_t{0};
+
+            // Reserve the tail position for the writer. The +2U advances
+            // minIndex one position past the tail. Since the tail and
+            // headIndex+1 alias the same physical ring-buffer position,
+            // this hides uncommitted headIndex+1 write state from
+            // readers.
+            auto const minIndex = (headIndex >= grainCount) ? (headIndex - grainCount + 2U) : std::uint64_t{0};
+
             if (in_index >= minIndex)
             {
                 auto const offset = in_index % grainCount;
