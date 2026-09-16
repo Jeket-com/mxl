@@ -37,6 +37,11 @@ namespace
         mxlRational frameRate{30, 1};
         std::uint64_t pattern{0};
         std::string textOverlay{"EBU DMF MXL"};
+        /// Skip textoverlay/clockoverlay/videoconvert/videoscale: videotestsrc
+        /// emits v210 natively, and the overlay chain is single-threaded and
+        /// cannot sustain 1080p59.94 on a modest CPU (~44-55 fps measured on a
+        /// 2.2 GHz Xeon). For transport/soak testing the pattern alone is enough.
+        bool noOverlay{false};
         std::uint32_t sliceSize;
 
         [[nodiscard]]
@@ -341,21 +346,32 @@ namespace
         {
             MXL_INFO("Creating video pipeline with config: {}", _config.display());
 
-            auto pipelineDesc = fmt::format(
-                "videotestsrc name=videotestsrc is-live=true do-timestamp=true pattern={} ! "
-                "video/x-raw,format=v210,width={},height={},framerate={}/{} ! "
-                "textoverlay text=\"{}\" font-desc=\"Sans, 36\" ! "
-                "clockoverlay ! "
-                "videoconvert ! "
-                "videoscale ! "
-                "queue ! "
-                "appsink name=appsink ",
-                _config.pattern,
-                _config.frameWidth,
-                _config.frameHeight,
-                _config.frameRate.numerator,
-                _config.frameRate.denominator,
-                _config.textOverlay);
+            auto pipelineDesc = _config.noOverlay
+                ? fmt::format(
+                      "videotestsrc name=videotestsrc is-live=true do-timestamp=true pattern={} ! "
+                      "video/x-raw,format=v210,width={},height={},framerate={}/{} ! "
+                      "queue ! "
+                      "appsink name=appsink ",
+                      _config.pattern,
+                      _config.frameWidth,
+                      _config.frameHeight,
+                      _config.frameRate.numerator,
+                      _config.frameRate.denominator)
+                : fmt::format(
+                      "videotestsrc name=videotestsrc is-live=true do-timestamp=true pattern={} ! "
+                      "video/x-raw,format=v210,width={},height={},framerate={}/{} ! "
+                      "textoverlay text=\"{}\" font-desc=\"Sans, 36\" ! "
+                      "clockoverlay ! "
+                      "videoconvert ! "
+                      "videoscale ! "
+                      "queue ! "
+                      "appsink name=appsink ",
+                      _config.pattern,
+                      _config.frameWidth,
+                      _config.frameHeight,
+                      _config.frameRate.numerator,
+                      _config.frameRate.denominator,
+                      _config.textOverlay);
 
             MXL_INFO("Generating following GStreamer video pipeline -> {}", pipelineDesc);
             launchPipeline(pipelineDesc, _config.frameRate);
@@ -843,6 +859,12 @@ int main(int argc, char** argv)
     auto textOverlayOpt = app.add_option("-t,--overlay-text", textOverlay, "Change the text overlay of the test source");
     textOverlayOpt->default_val("EBU DMF MXL");
 
+    auto noOverlay = false;
+    app.add_flag("--no-overlay",
+        noOverlay,
+        "Emit the raw test pattern only (no text/clock overlay, no videoconvert/videoscale). "
+        "The overlay chain is single-threaded and cannot sustain 1080p59.94 on modest CPUs.");
+
     auto groupHint = std::string{};
     auto groupHintOpt = app.add_option("-g, --group-hint", groupHint, "The group-hint value to use in the flow json definition");
     groupHintOpt->default_val("mxl-gst-testsrc-group");
@@ -881,6 +903,7 @@ int main(int argc, char** argv)
                         .frameRate = json_utils::getRational(flowNmos, "grain_rate"),
                         .pattern = pattern_map.at(pattern),
                         .textOverlay = textOverlay,
+                        .noOverlay = noOverlay,
                         .sliceSize = media_utils::getV210LineLength(frameWidth)};
 
                     auto gstPipeline = VideoPipeline{gstConfig};
