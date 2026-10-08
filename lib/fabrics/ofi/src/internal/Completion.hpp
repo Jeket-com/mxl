@@ -76,6 +76,12 @@ namespace mxl::lib::fabrics::ofi
             [[nodiscard]]
             Token token() const noexcept;
 
+            /** \brief True when the request did not fail itself but was flushed because its endpoint had already failed or was
+             * being closed (FI_ECANCELED).
+             */
+            [[nodiscard]]
+            bool isFlush() const noexcept;
+
         private:
             friend class CompletionQueue;
 

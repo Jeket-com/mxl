@@ -264,6 +264,41 @@ namespace mxl::lib::fabrics::ofi
     void RCInitiatorEndpoint::handleCompletionError(Completion::Error err)
     {
         MXL_ERROR("Received a completion error: {}", err.toString());
+
+        _state = std::visit(
+            overloaded{[](Idle state) -> State { return state; },
+                [](Connecting state) -> State { return state; },
+                [&](Connected state) -> State
+                {
+                    // A flushed request only echoes a failure that was handled when it happened.
+                    if (err.isFlush())
+                    {
+                        return state;
+                    }
+
+                    // A failed request puts a reliable-connected endpoint in the error state: every later request on it is
+                    // flushed, and the verbs provider shuts it down by queueing FI_SHUTDOWN (vrb_shutdown_ep). Only logging the
+                    // error left that event to be read below as the peer closing the connection, so the target was flushed,
+                    // evicted and never reconnected. Discard the outstanding transfers and reconnect on a fresh endpoint, as
+                    // an error event does. Closing the old endpoint also drops the shutdown event it queued.
+                    MXL_WARN("A transfer failed while connected, reconnecting the endpoint.");
+                    _proto->reset();
+                    return restart(state.ep);
+                },
+                [](Flushing state) -> State
+                {
+                    // A failed or flushed request still retires one of the completions the flush is waiting for.
+                    if (state.pending > 0)
+                    {
+                        state.pending--;
+                    }
+                    return state;
+                },
+                [](Done state) -> State
+                {
+                    return state;
+                }},
+            std::move(_state));
     }
 
     RCInitiatorEndpoint::Idle RCInitiatorEndpoint::restart(Endpoint const& old)
