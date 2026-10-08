@@ -346,32 +346,31 @@ namespace
         {
             MXL_INFO("Creating video pipeline with config: {}", _config.display());
 
-            auto pipelineDesc = _config.noOverlay
-                ? fmt::format(
-                      "videotestsrc name=videotestsrc is-live=true do-timestamp=true pattern={} ! "
-                      "video/x-raw,format=v210,width={},height={},framerate={}/{} ! "
-                      "queue ! "
-                      "appsink name=appsink ",
-                      _config.pattern,
-                      _config.frameWidth,
-                      _config.frameHeight,
-                      _config.frameRate.numerator,
-                      _config.frameRate.denominator)
-                : fmt::format(
-                      "videotestsrc name=videotestsrc is-live=true do-timestamp=true pattern={} ! "
-                      "video/x-raw,format=v210,width={},height={},framerate={}/{} ! "
-                      "textoverlay text=\"{}\" font-desc=\"Sans, 36\" ! "
-                      "clockoverlay ! "
-                      "videoconvert ! "
-                      "videoscale ! "
-                      "queue ! "
-                      "appsink name=appsink ",
-                      _config.pattern,
-                      _config.frameWidth,
-                      _config.frameHeight,
-                      _config.frameRate.numerator,
-                      _config.frameRate.denominator,
-                      _config.textOverlay);
+            auto pipelineDesc =
+                _config.noOverlay
+                    ? fmt::format("videotestsrc name=videotestsrc is-live=true do-timestamp=true pattern={} ! "
+                                  "video/x-raw,format=v210,width={},height={},framerate={}/{} ! "
+                                  "queue ! "
+                                  "appsink name=appsink ",
+                          _config.pattern,
+                          _config.frameWidth,
+                          _config.frameHeight,
+                          _config.frameRate.numerator,
+                          _config.frameRate.denominator)
+                    : fmt::format("videotestsrc name=videotestsrc is-live=true do-timestamp=true pattern={} ! "
+                                  "video/x-raw,format=v210,width={},height={},framerate={}/{} ! "
+                                  "textoverlay text=\"{}\" font-desc=\"Sans, 36\" ! "
+                                  "clockoverlay ! "
+                                  "videoconvert ! "
+                                  "videoscale ! "
+                                  "queue ! "
+                                  "appsink name=appsink ",
+                          _config.pattern,
+                          _config.frameWidth,
+                          _config.frameHeight,
+                          _config.frameRate.numerator,
+                          _config.frameRate.denominator,
+                          _config.textOverlay);
 
             MXL_INFO("Generating following GStreamer video pipeline -> {}", pipelineDesc);
             launchPipeline(pipelineDesc, _config.frameRate);
