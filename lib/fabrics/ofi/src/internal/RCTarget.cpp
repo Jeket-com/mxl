@@ -138,8 +138,9 @@ namespace mxl::lib::fabrics::ofi
                             // We have a connected event, so we can transition to the connected state
                             auto connected = Connected{.ep = std::move(state.ep)};
 
-                            // The endpoint is now ready, initialize the protocol.
-                            _proto->start(connected.ep);
+                            // The endpoint is now ready, initialize the protocol. Keep as many receives posted as the completion queue
+                            // they complete into can hold, so writes that land back to back are not NAKed "receiver not ready".
+                            _proto->start(connected.ep, _setupOptions.cqDepth.value_or(CompletionQueue::Attributes::DEFAULT_SIZE));
 
                             return connected;
                         }

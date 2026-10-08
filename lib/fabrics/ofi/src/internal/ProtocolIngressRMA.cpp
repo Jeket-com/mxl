@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ProtocolIngressRMA.hpp"
+#include <algorithm>
 #include "mxl-internal/Logging.hpp"
 #include "AudioBounceBuffer.hpp"
 #include "DataLayout.hpp"
@@ -36,11 +37,15 @@ namespace mxl::lib::fabrics::ofi
         return std::nullopt;
     }
 
-    void RMAGrainIngressProtocol::start(Endpoint const& endpoint)
+    void RMAGrainIngressProtocol::start(Endpoint const& endpoint, std::size_t recvDepth)
     {
         if (endpoint.domain()->usingRecvBufForCqData())
         {
-            endpoint.recv(immDataRegion());
+            // A write with immediate data writes nothing into the receive buffer, so every posted receive can share it.
+            for (std::size_t i = 0; i < std::max<std::size_t>(recvDepth, 1); ++i)
+            {
+                endpoint.recv(immDataRegion());
+            }
         }
     }
 
@@ -126,11 +131,15 @@ namespace mxl::lib::fabrics::ofi
         return TargetInfoBounceBufferInfo{.entryCount = entryCount, .entrySize = entrySize};
     }
 
-    void RMASampleIngressProtocol::start(Endpoint const& endpoint)
+    void RMASampleIngressProtocol::start(Endpoint const& endpoint, std::size_t recvDepth)
     {
         if (endpoint.domain()->usingRecvBufForCqData())
         {
-            endpoint.recv(immDataRegion());
+            // A write with immediate data writes nothing into the receive buffer, so every posted receive can share it.
+            for (std::size_t i = 0; i < std::max<std::size_t>(recvDepth, 1); ++i)
+            {
+                endpoint.recv(immDataRegion());
+            }
         }
     }
 

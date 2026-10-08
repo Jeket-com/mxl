@@ -36,8 +36,13 @@ namespace mxl::lib::fabrics::ofi
         virtual std::optional<TargetInfoBounceBufferInfo> bounceBufferInfo() const = 0;
 
         /** \brief Start receiving.
+         * \param endpoint The connected endpoint to receive on.
+         * \param recvDepth How many receives to keep posted for remote CQ data. Each write with immediate data consumes one, and
+         * read() reposts one per completion, so this is how many writes can land before the target reads their completions. With
+         * only one, a write that lands before the previous completion is read is NAKed "receiver not ready" and its initiator
+         * backs off before retrying. It must not exceed the depth of the completion queue the receives complete into.
          */
-        virtual void start(Endpoint const& endpoint) = 0;
+        virtual void start(Endpoint const& endpoint, std::size_t recvDepth) = 0;
 
         /** \brief Process a completion with the given immediate data.
          * \param endpoint The endpoint associated with the completion
