@@ -6,6 +6,7 @@
 #include <optional>
 #include <variant>
 #include <rdma/fi_eq.h>
+#include <rdma/fi_errno.h>
 #include "CompletionQueue.hpp" // IWYU pragma: keep
 #include "Exception.hpp"
 #include "VariantUtils.hpp"
@@ -49,6 +50,11 @@ namespace mxl::lib::fabrics::ofi
     Completion::Token Completion::Error::token() const noexcept
     {
         return tokenFromContextValue(_raw.op_context);
+    }
+
+    bool Completion::Error::isFlush() const noexcept
+    {
+        return _raw.err == FI_ECANCELED;
     }
 
     Completion::Data Completion::data() const
