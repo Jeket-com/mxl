@@ -4,6 +4,7 @@
 #include "mxl-internal/FlowParser.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -28,6 +29,47 @@ namespace mxl::lib
         // from allocating all the RAM on the system.
         constexpr auto MAX_WIDTH = std::uint32_t{7680};  ///< Maximum supported video width in pixels (8K UHD).
         constexpr auto MAX_HEIGHT = std::uint32_t{4320}; ///< Maximum supported video height in pixels (8K UHD).
+
+        /// Jeket fork extension jeket-mxl-vlg/1: the flow-definition key that asks for a variable-size
+        /// DATA grain, valued in bytes. `x-jeket:variable-data` is the vendor spelling, as the airchain
+        /// spec requires of a vendor flow-definition key (`x-<vendor>:<key>`).
+        constexpr auto VARIABLE_DATA_KEY = "x-jeket:variable-data";
+        /// The spelling JBS writers emitted before the vendor key existed. Read until no writer emits it.
+        constexpr auto LEGACY_VARIABLE_DATA_KEY = "mxl:grain_payload_size";
+
+        /**
+         * Read the variable-size grain payload a DATA flow definition asks for.
+         * \param[in] root The flow definition.
+         * \return The requested payload size in bytes, or std::nullopt when neither key is present
+         *      (the stock fixed-size data path).
+         * \throws std::invalid_argument A key is present but is not a number, or both spellings are
+         *      present with different values.
+         */
+        std::optional<double> findVariableDataSize(picojson::object const& root)
+        {
+            auto const read = [&root](char const* key) -> std::optional<double>
+            {
+                auto const it = root.find(key);
+                if (it == root.end())
+                {
+                    return std::nullopt;
+                }
+                if (!it->second.is<double>())
+                {
+                    throw std::invalid_argument{fmt::format("{} must be a number of bytes", key)};
+                }
+                return it->second.get<double>();
+            };
+
+            auto const vendor = read(VARIABLE_DATA_KEY);
+            auto const legacy = read(LEGACY_VARIABLE_DATA_KEY);
+            if (vendor && legacy && (*vendor != *legacy))
+            {
+                throw std::invalid_argument{
+                    fmt::format("{} ({}) and {} ({}) disagree", VARIABLE_DATA_KEY, *vendor, LEGACY_VARIABLE_DATA_KEY, *legacy)};
+            }
+            return vendor ? vendor : legacy;
+        }
 
         /**
          * Translate a NMOS IS-04 data format to a an mxlDataFormat enum.
@@ -379,20 +421,20 @@ namespace mxl::lib
         }
         else if (_format == MXL_DATA_FORMAT_DATA)
         {
-            // Variable-length grain opt-in: a data flow can request a custom grain
-            // payload size via mxl:grain_payload_size, independent of media_type.
-            // The 256-byte slice size used downstream lets totalSlices (uint16_t)
-            // address up to ~16 MB per grain; actual payload per write is signalled
-            // via validSlices. When the field is absent we fall back to the original
-            // fixed-size data path (4096-byte grain / 1-byte slice for video/smpte291).
-            if (auto const it = _root.find("mxl:grain_payload_size"); it != _root.end() && it->second.is<double>())
+            // Variable-length grain opt-in (jeket-mxl-vlg/1): a data flow can request a
+            // custom grain payload size via x-jeket:variable-data (or the legacy
+            // mxl:grain_payload_size), independent of media_type. The 256-byte slice
+            // size used downstream lets totalSlices (uint16_t) address up to ~16 MB per
+            // grain; actual payload per write is signalled via validSlices. When neither
+            // key is present we fall back to the original fixed-size data path
+            // (4096-byte grain / 1-byte slice for video/smpte291).
+            if (auto const requested = findVariableDataSize(_root); requested)
             {
-                auto const requested = it->second.get<double>();
-                if (!(requested > 0.0) || requested > static_cast<double>(16 * 1024 * 1024))
+                if (!(*requested > 0.0) || *requested > static_cast<double>(16 * 1024 * 1024))
                 {
-                    throw std::invalid_argument{fmt::format("Invalid mxl:grain_payload_size: {}", requested)};
+                    throw std::invalid_argument{fmt::format("Invalid variable-data grain size: {}", *requested)};
                 }
-                payloadSize = static_cast<std::size_t>(requested);
+                payloadSize = static_cast<std::size_t>(*requested);
             }
             else
             {
@@ -445,8 +487,7 @@ namespace mxl::lib
                 // Variable-length grain flows use 256-byte slices so totalSlices
                 // (uint16_t) can address up to ~16 MB per grain. Fixed-size data
                 // (e.g. video/smpte291) keeps the original 1-byte slice.
-                auto const it = _root.find("mxl:grain_payload_size");
-                sliceLengths[0] = (it != _root.end() && it->second.is<double>()) ? 256 : 1;
+                sliceLengths[0] = findVariableDataSize(_root) ? 256 : 1;
                 return sliceLengths;
             }
 
@@ -491,7 +532,7 @@ namespace mxl::lib
             {
                 // Variable-length grain flows: total slices = ceil(grain / 256).
                 // Fixed-size data flows keep one slice per grain byte.
-                if (auto const it = _root.find("mxl:grain_payload_size"); it != _root.end() && it->second.is<double>())
+                if (findVariableDataSize(_root))
                 {
                     constexpr auto kSliceSize = std::size_t{256};
                     return (getPayloadSize() + kSliceSize - 1) / kSliceSize;
