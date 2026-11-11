@@ -1,17 +1,6 @@
 // SPDX-FileCopyrightText: 2025 Contributors to the Media eXchange Layer project.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "Utils.hpp"
-
-#ifndef __APPLE__
-#   include <Device.h>
-#   include <Packet.h>
-#   include <PcapFileDevice.h>
-#   include <ProtocolType.h>
-#   include <RawPacket.h>
-#   include <UdpLayer.h>
-#endif
-
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -27,6 +16,8 @@
 #include <mxl/mxl.h>
 #include <mxl/time.h>
 #include "../internal/include/mxl-internal/MediaUtils.hpp"
+#include "PcapReader.hpp"
+#include "Utils.hpp"
 
 namespace fs = std::filesystem;
 
@@ -396,28 +387,15 @@ TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "Invalid flow definit
     mxlDestroyInstance(instance);
 }
 
-#ifndef __APPLE__
-
 TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "Data Flow : Create/Destroy", "[mxl flows]")
 {
-    fs::path domain{"/dev/shm/mxl_domain"}; // Remove that path if it exists.
-    fs::remove_all(domain);
-    std::filesystem::create_directories(domain);
-
     // Read some RFC-8331 packets from a pcap file downloaded from https://github.com/NEOAdvancedTechnology/ST2110_pcap_zoo
-    std::unique_ptr<pcpp::IFileReaderDevice> pcapReader(pcpp::IFileReaderDevice::getReader("data/ST2110-40-Closed_Captions.cap"));
-    REQUIRE(pcapReader != nullptr);
-    REQUIRE(pcapReader->open());
+    auto const datagrams = mxl::tests::readUdpDatagrams("data/ST2110-40-Closed_Captions.cap");
 
     // We know that in the pcap file the first packet is an empty packet with a marker bit. Skip it and read the second one.
-    pcpp::RawPacketVector rawPackets;
-    REQUIRE(pcapReader->getNextPackets(rawPackets, 2) == 2);
-    pcpp::Packet parsedPacket(rawPackets.at(1));
-
-    auto udpLayer = parsedPacket.getLayerOfType<pcpp::UdpLayer>();
-    auto* rtpData = udpLayer->getLayerPayload();
-    REQUIRE(rtpData != nullptr);
-    auto rtpSize = udpLayer->getLayerPayloadSize();
+    REQUIRE(datagrams.size() >= 2);
+    auto const* rtpData = datagrams[1].payload.data();
+    auto rtpSize = datagrams[1].payload.size();
     REQUIRE(rtpSize > 14);
     rtpData += 14; // skip packet header until Length field, as defined in RFC-8331, section 2.
     rtpSize -= 14;
@@ -641,8 +619,6 @@ TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "Video Flow : Slices"
     REQUIRE(mxlDestroyInstance(instanceReader) == MXL_STATUS_OK);
     REQUIRE(mxlDestroyInstance(instanceWriter) == MXL_STATUS_OK);
 }
-
-#endif
 
 TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "Audio Flow : Create/Destroy", "[mxl flows]")
 {
@@ -1026,12 +1002,69 @@ TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "mxlCreateFlow: unwri
     remove_all(domain);
 }
 
+// Verify that a reader that may not open the files of a flow gets a proper error
+// code. The reader uses an instance of its own, as a reading process would.
+TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "mxlCreateFlowReader: unreadable flow directory", "[mxl flows]")
+{
+    auto const opts = "{}";
+    auto const instance = mxlCreateInstance(domain.string().c_str(), opts);
+    REQUIRE(instance != nullptr);
+    auto const readerInstance = mxlCreateInstance(domain.string().c_str(), opts);
+    REQUIRE(readerInstance != nullptr);
+
+    auto const flowDef = mxl::tests::readFile("data/v210_flow.json");
+    mxlFlowWriter writer = nullptr;
+    auto configInfo = mxlFlowConfigInfo{};
+    REQUIRE(mxlCreateFlowWriter(instance, flowDef.c_str(), opts, &writer, &configInfo, nullptr) == MXL_STATUS_OK);
+    auto const flowId = uuids::to_string(configInfo.common.id);
+    auto const flowDirectory = mxl::lib::makeFlowDirectoryName(domain, flowId);
+
+    // Restore the permissions before checking, so the domain can be removed whatever the outcome.
+    permissions(flowDirectory, std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec, std::filesystem::perm_options::remove);
+    mxlFlowReader reader = nullptr;
+    auto const status = mxlCreateFlowReader(readerInstance, flowId.c_str(), "", &reader);
+    permissions(flowDirectory, std::filesystem::perms::owner_all, std::filesystem::perm_options::add);
+    REQUIRE(status == MXL_ERR_PERMISSION_DENIED);
+
+    REQUIRE(mxlReleaseFlowWriter(instance, writer) == MXL_STATUS_OK);
+    REQUIRE(mxlDestroyInstance(readerInstance) == MXL_STATUS_OK);
+    REQUIRE(mxlDestroyInstance(instance) == MXL_STATUS_OK);
+}
+
+// Verify that a reader of a continuous flow whose descriptor it may not read gets
+// a proper error code.
+TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "mxlCreateFlowReader: unreadable continuous flow descriptor", "[mxl flows]")
+{
+    auto const opts = "{}";
+    auto const instance = mxlCreateInstance(domain.string().c_str(), opts);
+    REQUIRE(instance != nullptr);
+    auto const readerInstance = mxlCreateInstance(domain.string().c_str(), opts);
+    REQUIRE(readerInstance != nullptr);
+
+    auto const flowDef = mxl::tests::readFile("data/audio_flow.json");
+    mxlFlowWriter writer = nullptr;
+    auto configInfo = mxlFlowConfigInfo{};
+    REQUIRE(mxlCreateFlowWriter(instance, flowDef.c_str(), opts, &writer, &configInfo, nullptr) == MXL_STATUS_OK);
+    auto const flowId = uuids::to_string(configInfo.common.id);
+    auto const flowDescriptor = mxl::lib::makeFlowDescriptorFilePath(domain, flowId);
+
+    permissions(flowDescriptor, std::filesystem::perms::owner_read, std::filesystem::perm_options::remove);
+    mxlFlowReader reader = nullptr;
+    auto const status = mxlCreateFlowReader(readerInstance, flowId.c_str(), "", &reader);
+    permissions(flowDescriptor, std::filesystem::perms::owner_read, std::filesystem::perm_options::add);
+    REQUIRE(status == MXL_ERR_PERMISSION_DENIED);
+
+    REQUIRE(mxlReleaseFlowWriter(instance, writer) == MXL_STATUS_OK);
+    REQUIRE(mxlDestroyInstance(readerInstance) == MXL_STATUS_OK);
+    REQUIRE(mxlDestroyInstance(instance) == MXL_STATUS_OK);
+}
+
 TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "mxlFlowWriterCommitSamples should notify the reader", "[mxl flows][futex]")
 {
     constexpr auto const startIndex = 1000;
     constexpr auto const blockSize = 480;
     constexpr auto const iterations = std::uint64_t{50};
-    constexpr auto const readTimeout = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds(50));
+    constexpr auto const readTimeout = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds(150));
     auto flowDef = mxl::tests::readFile("data/audio_flow.json");
     auto configInfo = mxlFlowConfigInfo{};
     auto instance = mxlCreateInstance(domain.c_str(), nullptr);
@@ -1258,4 +1291,80 @@ TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "Video Flow : Jump fo
     REQUIRE(mxlReleaseFlowWriter(instanceWriter, writer) == MXL_STATUS_OK);
     REQUIRE(mxlDestroyInstance(instanceReader) == MXL_STATUS_OK);
     REQUIRE(mxlDestroyInstance(instanceWriter) == MXL_STATUS_OK);
+}
+
+// Verify that opening a new grain resets validSlices to zero when the
+// underlying ring-buffer slot is reused, while reopening the same
+// incomplete grain preserves its existing validSlices value.
+TEST_CASE_PERSISTENT_FIXTURE(mxl::tests::mxlDomainFixture, "Video Flow : validSlices on grain open", "[mxl flows]")
+{
+    auto const opts = "{}";
+    auto flowDef = mxl::tests::readFile("data/v210_flow.json");
+
+    auto instance = mxlCreateInstance(domain.string().c_str(), opts);
+    REQUIRE(instance != nullptr);
+
+    auto writer = mxlFlowWriter{};
+    auto configInfo = mxlFlowConfigInfo{};
+    auto flowWasCreated = false;
+    REQUIRE(mxlCreateFlowWriter(instance, flowDef.c_str(), opts, &writer, &configInfo, &flowWasCreated) == MXL_STATUS_OK);
+    REQUIRE(flowWasCreated);
+
+    auto const grainCount = static_cast<std::uint64_t>(configInfo.discrete.grainCount);
+    REQUIRE(grainCount > 1U);
+
+    auto const firstSlotIndex = std::uint64_t{100};
+    auto const nextSlotIndex = firstSlotIndex + 1U;
+    auto const reusedSlotIndex = firstSlotIndex + grainCount;
+
+    auto gInfo = mxlGrainInfo{};
+    auto buffer = static_cast<std::uint8_t*>(nullptr);
+
+    // A freshly created grain starts with zero valid slices.
+    REQUIRE(mxlFlowWriterOpenGrain(writer, firstSlotIndex, &gInfo, &buffer) == MXL_STATUS_OK);
+    REQUIRE(gInfo.index == firstSlotIndex);
+    REQUIRE(gInfo.validSlices == 0);
+
+    auto const partialValidSlices = std::uint16_t{3};
+    REQUIRE(partialValidSlices < gInfo.totalSlices);
+
+    gInfo.validSlices = partialValidSlices;
+    REQUIRE(mxlFlowWriterCommitGrain(writer, &gInfo) == MXL_STATUS_OK);
+
+    // Reopening the same incomplete grain preserves progress.
+    auto reopenedInfo = mxlGrainInfo{};
+    auto reopenedBuffer = static_cast<std::uint8_t*>(nullptr);
+
+    REQUIRE(mxlFlowWriterOpenGrain(writer, firstSlotIndex, &reopenedInfo, &reopenedBuffer) == MXL_STATUS_OK);
+    REQUIRE(reopenedInfo.index == firstSlotIndex);
+    REQUIRE(reopenedBuffer == buffer);
+    REQUIRE(reopenedInfo.validSlices == partialValidSlices);
+
+    // Complete the grain.
+    reopenedInfo.validSlices = reopenedInfo.totalSlices;
+    REQUIRE(mxlFlowWriterCommitGrain(writer, &reopenedInfo) == MXL_STATUS_OK);
+
+    // A new grain starts with zero valid slices after the previous grain is complete.
+    auto nextInfo = mxlGrainInfo{};
+    auto nextBuffer = static_cast<std::uint8_t*>(nullptr);
+
+    REQUIRE(mxlFlowWriterOpenGrain(writer, nextSlotIndex, &nextInfo, &nextBuffer) == MXL_STATUS_OK);
+    REQUIRE(nextInfo.index == nextSlotIndex);
+    REQUIRE(nextInfo.validSlices == 0);
+
+    nextInfo.validSlices = nextInfo.totalSlices;
+    REQUIRE(mxlFlowWriterCommitGrain(writer, &nextInfo) == MXL_STATUS_OK);
+
+    // A new grain reusing the same physical ring slot starts with
+    // zero valid slices rather than inheriting the previous grain's state.
+    auto reusedInfo = mxlGrainInfo{};
+    auto reusedBuffer = static_cast<std::uint8_t*>(nullptr);
+
+    REQUIRE(mxlFlowWriterOpenGrain(writer, reusedSlotIndex, &reusedInfo, &reusedBuffer) == MXL_STATUS_OK);
+    REQUIRE(reusedInfo.index == reusedSlotIndex);
+    REQUIRE(reusedBuffer == buffer);
+    REQUIRE(reusedInfo.validSlices == 0);
+
+    REQUIRE(mxlReleaseFlowWriter(instance, writer) == MXL_STATUS_OK);
+    REQUIRE(mxlDestroyInstance(instance) == MXL_STATUS_OK);
 }

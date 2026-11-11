@@ -45,53 +45,66 @@ An _mxlFlowReader_ will only _mmap_ flow resources in readonly mode (PROT_READ),
 
 See [timing model](./Timing.md)
 
-## Ring buffer types 
+## Ring buffer types
 
-The MXL SDK provides two ringbuffer types: Discrete and Continuous.  Discrete ringbuffers are used for granular data types such as video and ancillary data.  Continuous ringbuffers are used for audio. 
+The MXL SDK provides two ringbuffer types: Discrete and Continuous.  Discrete ringbuffers are used for granular data types such as video and ancillary data.  Continuous ringbuffers are used for audio.
 
 ### Ring buffer access model
 
 Continuous: the tail half of the ring buffer is reserved for the writer, and readers can access the remaining half.
 
-Discrete: the tail entry of the ring buffer is reserved for the writer, and readers can access the remaining entries.
+Discrete (including Events): the tail entry of the ring buffer is reserved for the writer, and readers can access the remaining entries.
 
 ## Discrete Grain I/O
 
 Grain I/O can be 'partial'. In other words, a FlowWriter can write the bytes of a grain progressively (as slices for example).
 
-The following example demonstrates how a FlowWriter may write a grain as slices using multiple `mxlFlowWriterCommitGrain()` calls. The important field here is the mxlGrainInfo.committedSize: it tells us how many bytes in the grain are valid. A complete grain will have `mxlGrainInfo.committedSize == mxlGrainInfo.grainSize`. It is imperative that FlowReaders _always_ take into consideration the `mxlGrainInfo.committedSize` field before making use of the grain buffer. The `mxlFlowReaderGetGrain` function will return as soon as new data is committed to the grain.
+The following example demonstrates how a FlowWriter may write a grain as slices using multiple `mxlFlowWriterCommitGrain()` calls. The important field here is `mxlGrainInfo.validSlices`: it tells us how many of the grain's `mxlGrainInfo.totalSlices` are committed and valid. A slice is the smallest unit that can be committed: one picture line for video, one byte for data. A complete grain has `mxlGrainInfo.validSlices == mxlGrainInfo.totalSlices`. It is imperative that FlowReaders _always_ take into consideration the `mxlGrainInfo.validSlices` field before making use of the grain buffer. `mxlFlowReaderGetGrain()` waits for the full grain; to consume a grain progressively, use `mxlFlowReaderGetGrainSlice()`, which returns as soon as `minValidSlices` slices are committed.
 
-### Example Grain I/O (from the [unit tests](../lib/tests/test_flows.cpp))
+### Example Grain I/O (from the [unit tests](https://github.com/dmf-mxl/mxl/blob/main/lib/tests/test_flows.cpp))
 
 ```c++
-    ///
-    /// Write and read a grain in 8 slices
-    ///
-
     /// Open the grain.
     mxlGrainInfo gInfo;
-    uint8_t *buffer = nullptr;
+    uint8_t* buffer = nullptr;
+    REQUIRE(mxlFlowWriterOpenGrain(writer, index, &gInfo, &buffer) == MXL_STATUS_OK);
 
-    /// Open the grain for writing.
-    REQUIRE( mxlFlowWriterOpenGrain( instanceWriter, writer, index, &gInfo, &buffer ) == MXL_STATUS_OK );
+    /// Get some info about the freshly created flow.  Since no grains have been commited, the head should still be at 0.
+    mxlFlowInfo flowInfo1;
+    REQUIRE(mxlFlowReaderGetInfo(reader, &flowInfo1) == MXL_STATUS_OK);
+    REQUIRE(flowInfo1.runtime.headIndex == 0);
 
-    const size_t maxSlice = 8;
-    auto sliceSize = gInfo.grainSize / maxSlice;
-    for ( size_t slice = 0; slice < maxSlice; slice++ )
+    // Total number of batches that will be written
+    auto const numBatches =
+        (gInfo.totalSlices + flowInfo1.config.common.maxCommitBatchSizeHint - 1U) / flowInfo1.config.common.maxCommitBatchSizeHint;
+    auto defaultBatchSize = std::size_t{flowInfo1.config.common.maxCommitBatchSizeHint};
+
+    for (auto batchIndex = std::size_t{0}; batchIndex < numBatches; batchIndex++)
     {
-        /// Write a slice the grain.
-        gInfo.committedSize += sliceSize;
-        REQUIRE( mxlFlowWriterCommitGrain( instanceWriter, writer, &gInfo ) == MXL_STATUS_OK );
+        auto batchSize = defaultBatchSize;
 
-        mxlFlowRuntimeInfo sliceFlowRuntimeInfo;
-        REQUIRE( mxlFlowReaderGetRuntimeInfo( instanceReader, reader, &sliceFlowRuntimeInfo ) == MXL_STATUS_OK );
-        REQUIRE( sliceFlowRuntimeInfo.headIndex == index );
+        // If the total number of slices is not a multiple of the default batch size, the last batch must
+        // be the number of remaining slices
+        if ((batchIndex + 1) * batchSize > gInfo.totalSlices)
+        {
+            batchSize = gInfo.totalSlices - gInfo.validSlices;
+        }
+
+        /// Write a slice to the grain.
+        gInfo.validSlices += batchSize;
+        REQUIRE(mxlFlowWriterCommitGrain(writer, &gInfo) == MXL_STATUS_OK);
+
+        mxlFlowRuntimeInfo sliceRuntimeInfo;
+        REQUIRE(mxlFlowReaderGetRuntimeInfo(reader, &sliceRuntimeInfo) == MXL_STATUS_OK);
+        REQUIRE(sliceRuntimeInfo.headIndex == index);
 
         /// Read back the partial grain using the flow reader.
-        REQUIRE( mxlFlowReaderGetGrain( instanceReader, reader, index, 8, &gInfo, &buffer ) == MXL_STATUS_OK );
+        std::uint8_t* readBuffer = nullptr;
+        auto const expectedValidSlices = std::min(defaultBatchSize * (batchIndex + 1), static_cast<std::size_t>(gInfo.totalSlices));
+        REQUIRE(mxlFlowReaderGetGrainSlice(reader, index, expectedValidSlices, 8, &gInfo, &readBuffer) == MXL_STATUS_OK);
 
-        // Validate the committed size
-        REQUIRE( gInfo.committedSize == sliceSize * ( slice + 1 ) );
+        // Validate the commited size
+        REQUIRE(gInfo.validSlices == expectedValidSlices);
     }
 ```
 
@@ -234,16 +247,17 @@ A few important rules fall straight out of the data structure:
 # Aligned Processing of Multiple Flows
 
 Media functions oftentimes have the requirement to consume multiple, time aligned flows concurrently. In order to
-facilitate this use case MXL offers *Flow Synchronization Groups* that allow synchronizing on data availability across
+facilitate this use case MXL offers _Flow Synchronization Groups_ that allow synchronizing on data availability across
 multiple flows.
 
-A *Flow Synchronization Group* is set up by creating it and adding one or more readers to it, by calling either
-* `mxlFlowSynchronizationGroupAddReader()` if the reader operates on a continuous flow or the reader operates on
+A _Flow Synchronization Group_ is set up by creating it and adding one or more readers to it, by calling either
+
+- `mxlFlowSynchronizationGroupAddReader()` if the reader operates on a continuous flow or the reader operates on
     a discrete flow and the intention is to consume entire grains, or
-* `mxlFlowSynchronizationGroupAddPartialGrainReader()` if the reader operates on a discrete flow and the intention is to
+- `mxlFlowSynchronizationGroupAddPartialGrainReader()` if the reader operates on a discrete flow and the intention is to
     consume partial grains, for which a specified number of slices has to be available at the time of synchronization.
 
-Once a *Flow Synchronization Group* is set up clients can synchronize on grain(slice)s or samples corresponding to a
+Once a _Flow Synchronization Group_ is set up clients can synchronize on grain(slice)s or samples corresponding to a
 specified time stamp to become available by calling `mxlFlowSynchronizationGroupWaitForDataAt()`.
 
 Please note that the choice has been made to synchronize on timestamps rather than indices, because the former
@@ -263,7 +277,7 @@ uint64_t nextIndex = ...;
 uint64_t const nextTimestamp = mxlIndexToTimestamp(&outputRate, nextIndex);
 ```
 
-Then the processing loop consuming multiple flows tracked by a *Flow Synchronization Group* can look like this:
+Then the processing loop consuming multiple flows tracked by a _Flow Synchronization Group_ can look like this:
 
 ```c
 // Assume the following variables to be initialized out of the scope of this code section
@@ -286,6 +300,10 @@ while (running)
 }
 ```
 
+## Events ring buffers
+
+Documentation for the events ring buffers is available in [Event Flows](EventFlows.md)
+
 # Grain formats
 
 ## Video
@@ -296,11 +314,51 @@ Video grains can be of two different formats: video/v210 for video without trans
 
 The `video/v210` format is an uncompressed buffer format carrying 10 bit 4:2:2 video. A detailed description of the format can be found [here](https://wiki.multimedia.cx/index.php/V210) and [here](https://developer.apple.com/library/archive/technotes/tn2162/_index.html#//apple_ref/doc/uid/DTS40013070-CH1-TNTAG8-V210__4_2_2_COMPRESSION_TYPE).
 
+When the flow definition does not specify the range of the sample values, the samples are _video range_: Y from 64 to 940, and Cb and Cr from 64 to 960. SMPTE ST 2110-20 calls this range `NARROW`.
+
+```
+32-bit Word Structure (Little-Endian), 4 words = 1 group of 6 pixels (16 bytes):
+┌──────┬───────┬───────────────────────────────┬───────────────────────────────┬───────────────────────────────┐
+│ Word │ 31 30 │ 29 28 27 26 25 24 23 22 21 20 │ 19 18 17 16 15 14 13 12 11 10 │  9  8  7  6  5  4  3  2  1  0 │
+├──────┼───────┼───────────────────────────────┼───────────────────────────────┼───────────────────────────────┤
+│  0   │ unused│             Cr 0              │              Y 0              │             Cb 0              │
+│  1   │ unused│              Y 2              │             Cb 1              │              Y 1              │
+│  2   │ unused│             Cb 2              │              Y 3              │             Cr 1              │
+│  3   │ unused│              Y 5              │             Cr 2              │              Y 4              │
+└──────┴───────┴───────────────────────────────┴───────────────────────────────┴───────────────────────────────┘
+Pixel Mapping:
+┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
+│ Pixel 0 │ Pixel 1 │ Pixel 2 │ Pixel 3 │ Pixel 4 │ Pixel 5 │
+│   Y 0   │   Y 1   │   Y 2   │   Y 3   │   Y 4   │   Y 5   │
+├─────────┴─────────┼─────────┴─────────┼─────────┴─────────┤
+│     Cb 0, Cr 0    │     Cb 1, Cr 1    │     Cb 2, Cr 2    │
+└───────────────────┴───────────────────┴───────────────────┘
+Line Structure:
+┌──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
+│  Group 0 │  Group 1 │  Group 2 │    ...   │  Group N │  Padding │
+│ 6 pixels │ 6 pixels │ 6 pixels │          │ 2/4/6 px │          │
+└──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
+                                                                  ↑
+                                                          128-byte aligned
+Example (1280x720):
+- Width: 1280 pixels
+- Line length: ⌈1280/48⌉ × 128 = 27 × 128 = 3456 bytes
+- Groups used: ⌈1280/6⌉ = 214 groups (3424 bytes)
+- Last group: 2 pixels (word 0, plus Y 1 in bits 0-9 of word 1)
+- Padding: 32 bytes (2 groups) to reach 128-byte alignment
+
+Key points:
+• Each 32-bit word contains 3 samples (10 bits each); bits 30-31 unused
+• Each 16-byte group carries 6 pixels: 6 luma + 3 Cb + 3 Cr samples
+• Each Cb/Cr pair is shared by two horizontally adjacent pixels
+• Lines are padded to a multiple of 48 pixels (128 bytes)
+```
+
 ### video/v210a (v210 + alpha)
 
-The `video/v210a` format contains both fill and key inside a single grain.  The fill part starts at byte 0 of the grain and follows the v210 definition above. The key buffer is found immediately after the fill buffer.  Samples are organized in blocks of 32 bit values in little-endian.  Each block contains 3 luma samples, one each in bits 0 - 9, 10 - 19 and 20 - 29, the remaining two bits are unused.  The start of each line is aligned to a multiple of 4 bytes, where unused blocks are padded with 0.  The last block of a line might have more padding than just the last 2 bits if the width is not divisible by 3.  For example, 1280x720 resolution has padding for bits 20 to 31 on the last block.
+The `video/v210a` format contains both fill and key inside a single grain. The fill part starts at byte 0 of the grain and follows the v210 definition above. The key buffer is found immediately after the fill buffer. Samples are organized in blocks of 32 bit values in little-endian. Each block contains 3 alpha samples, one each in bits 0 - 9, 10 - 19 and 20 - 29, the remaining two bits are unused. The start of each line is aligned to a multiple of 4 bytes, where unused blocks are padded with 0. The last block of a line might have more padding than just the last 2 bits if the width is not divisible by 3. For example, 1280x720 resolution has padding for bits 20 to 31 on the last block.
 
-Alpha samples are 'straight' (not premultiplied) and follow the same data range as the fill.  For example, if the fill is _video range_ (64 to 960) then the samples of the key are also _video range_.
+Alpha samples are 'straight' (not premultiplied) and follow the same data range as the fill.  For example, if the fill is _video range_ then the samples of the key are also _video range_ (64 to 940).
 
 ```
 video/v210a Grain Structure:
@@ -312,31 +370,31 @@ video/v210a Grain Structure:
 │                       (alpha channel)                          │
 └────────────────────────────────────────────────────────────────┘
 
+KEY BUFFER:
+
 32-bit Block Structure (Little-Endian):
-┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+┌───────┬───────────────────────────────┬───────────────────────────────┬───────────────────────────────┐
 │ 31 30 │ 29 28 27 26 25 24 23 22 21 20 │ 19 18 17 16 15 14 13 12 11 10 │  9  8  7  6  5  4  3  2  1  0 │
 ├───────┼───────────────────────────────┼───────────────────────────────┼───────────────────────────────┤
-│unused │         Luma Sample 2         │         Luma Sample 1         │         Luma Sample 0         │
-│  bits │         (bits 20-29)          │         (bits 10-19)          │           (bits 0-9)          │
+│ unused│        Alpha Sample 2         │        Alpha Sample 1         │        Alpha Sample 0         │
 └───────┴───────────────────────────────┴───────────────────────────────┴───────────────────────────────┘
 
 Line Structure:
-┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
-│ Block 0 │ Block 1 │ Block 2 │   ...   │ Block N │ Padding │
-│ 3 luma  │ 3 luma  │ 3 luma  │         │ 1-3 luma│ (zeros) │
-└─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
-                                                            ↑
-                                                      4-byte aligned
+┌──────────┬──────────┬──────────┬──────────┬──────────┐
+│  Block 0 │  Block 1 │  Block 2 │    ...   │  Block N │
+│  3 alpha │  3 alpha │  3 alpha │          │ 1-3 alpha│
+└──────────┴──────────┴──────────┴──────────┴──────────┘
+                                                       ↑
+                                                 4-byte aligned
 
 Example (1280x720):
 - Width: 1280 pixels
 - Blocks per line: ⌈1280/3⌉ = 427 blocks
-- Last block: 1 pixel luma sample + zero padding in bits 10-31
-
+- Last block: 1 pixel alpha sample + zero padding in bits 10-31
 
 Key points:
 • Fill buffer (v210) comes first, followed immediately by key buffer (alpha)
-• Each 32-bit block contains 3 luma samples (10 bits each)
+• Each 32-bit block contains 3 alpha samples (10 bits each)
 • Lines are 4-byte aligned with zero padding
 ```
 
@@ -346,8 +404,8 @@ Key points:
 
 The `audio/float32` format has audio stored as 32 bit [IEEE 754](https://standards.ieee.org/ieee/754/6210/) float values with a full-scale range of \[−1.0 ; +1.0]\. This is the same audio representation as in RIFF/WAV files with `<wFormatTag>` `0x0003` `WAVE_FORMAT_IEEE_FLOAT`.
 
-Please note that flow producing media functions are not required to stay within the full-scale range and *should not* artificially clamp values to that range. Instead flow consuming media functions that are sensitive to levels exceeding 0 dbFS should, as a fail-safe measure clamp the sample values read to the supported range. This gives operators increased freedom in architecting their processing pipelines and retaining maximum fidelity.
+Please note that flow producing media functions are not required to stay within the full-scale range and _should not_ artificially clamp values to that range. Instead flow consuming media functions that are sensitive to levels exceeding 0 dbFS should, as a fail-safe measure clamp the sample values read to the supported range. This gives operators increased freedom in architecting their processing pipelines and retaining maximum fidelity.
 
 ## Ancillary Data
 
-The `video/smpte291` format is an ancillary data payload based on [RFC 8331](https://datatracker.ietf.org/doc/html/rfc8331#section-2).   Only the bytes starting at the *Length* field (See section 2 of RFC 8331) are stored in the grain (bytes 0 to 13 are redundant in the context of MXL and are not stored).
+The `video/smpte291` format is an ancillary data payload based on [RFC 8331](https://datatracker.ietf.org/doc/html/rfc8331#section-2).   Only the bytes starting at the _Length_ field (See section 2 of RFC 8331) are stored in the grain (bytes 0 to 13 are redundant in the context of MXL and are not stored).

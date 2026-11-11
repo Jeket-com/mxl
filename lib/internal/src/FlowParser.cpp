@@ -4,6 +4,7 @@
 #include "mxl-internal/FlowParser.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -26,8 +27,49 @@ namespace mxl::lib
 
         // this are arbitrary limits, but we need to put a cap somewhere to prevent a bad json document
         // from allocating all the RAM on the system.
-        constexpr auto MAX_WIDTH = 7680u;  // 8K UHD
-        constexpr auto MAX_HEIGHT = 4320u; // 8K UHD
+        constexpr auto MAX_WIDTH = std::uint32_t{7680};  ///< Maximum supported video width in pixels (8K UHD).
+        constexpr auto MAX_HEIGHT = std::uint32_t{4320}; ///< Maximum supported video height in pixels (8K UHD).
+
+        /// Jeket fork extension jeket-mxl-vlg/1: the flow-definition key that asks for a variable-size
+        /// DATA grain, valued in bytes. `x-jeket:variable-data` is the vendor spelling, as the airchain
+        /// spec requires of a vendor flow-definition key (`x-<vendor>:<key>`).
+        constexpr auto VARIABLE_DATA_KEY = "x-jeket:variable-data";
+        /// The spelling JBS writers emitted before the vendor key existed. Read until no writer emits it.
+        constexpr auto LEGACY_VARIABLE_DATA_KEY = "mxl:grain_payload_size";
+
+        /**
+         * Read the variable-size grain payload a DATA flow definition asks for.
+         * \param[in] root The flow definition.
+         * \return The requested payload size in bytes, or std::nullopt when neither key is present
+         *      (the stock fixed-size data path).
+         * \throws std::invalid_argument A key is present but is not a number, or both spellings are
+         *      present with different values.
+         */
+        std::optional<double> findVariableDataSize(picojson::object const& root)
+        {
+            auto const read = [&root](char const* key) -> std::optional<double>
+            {
+                auto const it = root.find(key);
+                if (it == root.end())
+                {
+                    return std::nullopt;
+                }
+                if (!it->second.is<double>())
+                {
+                    throw std::invalid_argument{fmt::format("{} must be a number of bytes", key)};
+                }
+                return it->second.get<double>();
+            };
+
+            auto const vendor = read(VARIABLE_DATA_KEY);
+            auto const legacy = read(LEGACY_VARIABLE_DATA_KEY);
+            if (vendor && legacy && (*vendor != *legacy))
+            {
+                throw std::invalid_argument{
+                    fmt::format("{} ({}) and {} ({}) disagree", VARIABLE_DATA_KEY, *vendor, LEGACY_VARIABLE_DATA_KEY, *legacy)};
+            }
+            return vendor ? vendor : legacy;
+        }
 
         /**
          * Translate a NMOS IS-04 data format to a an mxlDataFormat enum.
@@ -52,6 +94,10 @@ namespace mxl::lib
                 if (tail == "audio"sv)
                 {
                     return MXL_DATA_FORMAT_AUDIO;
+                }
+                if ((tail == "event"sv) || (tail == "data.event"sv))
+                {
+                    return MXL_DATA_FORMAT_EVENT;
                 }
                 if (tail == "data"sv)
                 {
@@ -117,75 +163,68 @@ namespace mxl::lib
             return result;
         }
 
-        //
-        // Validates that the group hint tag is present and valid
-        // See https://specs.amwa.tv/nmos-parameter-registers/branches/main/tags/grouphint.html
-        //
+        /**
+         * @brief Validate one group hint's name, role and optional scope.
+         * @param value JSON value expected to contain a group hint string.
+         * @return True for a nonempty name and role with an optional device/node scope.
+         * @throws std::exception Allocation fails while splitting the hint.
+         */
+        bool validateGroupHintValue(picojson::value const& value)
+        {
+            if (!value.is<std::string>())
+            {
+                MXL_ERROR("Invalid group hint value. Not a string.");
+                return false;
+            }
+
+            auto const& hint = value.get<std::string>();
+            auto parts = std::vector<std::string_view>{};
+            for (auto part : hint | std::views::split(':'))
+            {
+                parts.emplace_back(std::ranges::data(part), std::ranges::size(part));
+            }
+            if ((parts.size() < 2) || (parts.size() > 3))
+            {
+                MXL_ERROR("Invalid group hint value '{}'. Expected format '<group-name>:<role-in-group>[:<group-scope>]'", hint);
+                return false;
+            }
+            if (parts[0].empty() || parts[1].empty())
+            {
+                MXL_ERROR("Invalid group hint value '{}'. Group name and role must not be empty.", hint);
+                return false;
+            }
+            if ((parts.size() == 3) && (parts[2] != "device") && (parts[2] != "node"))
+            {
+                MXL_ERROR("Invalid group hint value '{}'. Group scope must be either 'device' or 'node'.", hint);
+                return false;
+            }
+            return true;
+        }
+
+        /**
+         * @brief Validate the presence and contents of the flow's group hint tag.
+         * @param in_object Flow definition containing the tags object.
+         * @return True if at least one group hint exists and every hint is valid.
+         */
         bool validateGroupHint(picojson::object const& in_object)
         {
             try
             {
-                // obtain the tags object. Will throw if not found or not an object
                 auto const tags = fetchAs<picojson::object>(in_object, "tags");
-
-                // obtain the specific tag array from the tags object. Will throw if not found or not an array
-                auto const& groupHints = fetchAs<picojson::array>(tags, "urn:x-nmos:tag:grouphint/v1.0");
-
-                // we need at least a group hint
+                auto const groupHints = fetchAs<picojson::array>(tags, "urn:x-nmos:tag:grouphint/v1.0");
                 if (groupHints.empty())
                 {
                     MXL_ERROR("Group hint tag found but empty.");
                     return false;
                 }
-                else
+                for (auto const& value : groupHints)
                 {
-                    // iterate over the array and confirm that all values are strings and follow the
-                    // expected format.
-                    // "<group-name>:<role-in-group>[:<group-scope>]" where group-scope if present, is either device or node
-                    for (auto const& v : groupHints)
+                    if (!validateGroupHintValue(value))
                     {
-                        if (!v.is<std::string>())
-                        {
-                            MXL_ERROR("Invalid group hint value. Not a string.");
-                            return false;
-                        }
-
-                        // Get the array item
-                        auto const& s = v.get<std::string>();
-                        // Split the string into parts separated by ':'
-                        auto parts = s | std::views::split(':') |
-                                     std::views::transform([&](auto&& rng) { return std::string_view(&*rng.begin(), std::ranges::distance(rng)); });
-
-                        auto vec = std::vector<std::string_view>{parts.begin(), parts.end()};
-                        if ((vec.size() < 2) || (vec.size() > 3))
-                        {
-                            MXL_ERROR("Invalid group hint value '{}'. Expected format '<group-name>:<role-in-group>[:<group-scope>]'", s);
-                            return false;
-                        }
-
-                        // Validate the group name and role
-                        auto const& groupName = vec[0];
-                        auto const& role = vec[1];
-                        if (groupName.empty() || role.empty())
-                        {
-                            MXL_ERROR("Invalid group hint value '{}'. Group name and role must not be empty.", s);
-                            return false;
-                        }
-
-                        // Validate the group scope if present
-                        if (vec.size() == 3)
-                        {
-                            auto const& groupScope = vec[2];
-                            if (groupScope != "device" && groupScope != "node")
-                            {
-                                MXL_ERROR("Invalid group hint value '{}'. Group scope must be either 'device' or 'node'.", s);
-                                return false;
-                            }
-                        }
+                        return false;
                     }
-                    // all the tags passed validation
-                    return true;
                 }
+                return true;
             }
             catch (std::exception const& e)
             {
@@ -232,7 +271,7 @@ namespace mxl::lib
         _format = translateFlowFormat(fetchAs<std::string>(_root, "format"));
 
         // Read the grain rate if this is not an audio flow.
-        if (mxlIsDiscreteDataFormat(_format))
+        if (mxlIsDiscreteDataFormat(_format) || mxlIsEventDataFormat(_format))
         {
             _grainRate = extractRational(fetchAs<picojson::object>(_root, "grain_rate"));
         }
@@ -243,6 +282,11 @@ namespace mxl::lib
         else
         {
             throw std::domain_error{"Unsupported flow format."};
+        }
+
+        if (mxlIsEventDataFormat(_format) && ((_grainRate.numerator <= 0) || (_grainRate.denominator <= 0)))
+        {
+            throw std::invalid_argument{"Event grain_rate must be positive."};
         }
 
         // Validate that we have a non empty label
@@ -284,7 +328,7 @@ namespace mxl::lib
             }
 
             constexpr auto validValues = std::array{"progressive", "interlaced_tff", "interlaced_bff"};
-            bool match = std::ranges::any_of(validValues, [&](auto v) { return interlaceMode == v; });
+            auto const match = std::ranges::any_of(validValues, [&](auto v) noexcept { return interlaceMode == v; });
             if (!match)
             {
                 auto msg = fmt::format("Invalid interlace_mode: {}", interlaceMode);
@@ -377,20 +421,20 @@ namespace mxl::lib
         }
         else if (_format == MXL_DATA_FORMAT_DATA)
         {
-            // Variable-length grain opt-in: a data flow can request a custom grain
-            // payload size via mxl:grain_payload_size, independent of media_type.
-            // The 256-byte slice size used downstream lets totalSlices (uint16_t)
-            // address up to ~16 MB per grain; actual payload per write is signalled
-            // via validSlices. When the field is absent we fall back to the original
-            // fixed-size data path (4096-byte grain / 1-byte slice for video/smpte291).
-            if (auto const it = _root.find("mxl:grain_payload_size"); it != _root.end() && it->second.is<double>())
+            // Variable-length grain opt-in (jeket-mxl-vlg/1): a data flow can request a
+            // custom grain payload size via x-jeket:variable-data (or the legacy
+            // mxl:grain_payload_size), independent of media_type. The 256-byte slice
+            // size used downstream lets totalSlices (uint16_t) address up to ~16 MB per
+            // grain; actual payload per write is signalled via validSlices. When neither
+            // key is present we fall back to the original fixed-size data path
+            // (4096-byte grain / 1-byte slice for video/smpte291).
+            if (auto const requested = findVariableDataSize(_root); requested)
             {
-                auto const requested = it->second.get<double>();
-                if (!(requested > 0.0) || requested > static_cast<double>(16 * 1024 * 1024))
+                if (!(*requested > 0.0) || *requested > static_cast<double>(16 * 1024 * 1024))
                 {
-                    throw std::invalid_argument{fmt::format("Invalid mxl:grain_payload_size: {}", requested)};
+                    throw std::invalid_argument{fmt::format("Invalid variable-data grain size: {}", *requested)};
                 }
-                payloadSize = static_cast<std::size_t>(requested);
+                payloadSize = static_cast<std::size_t>(*requested);
             }
             else
             {
@@ -405,6 +449,10 @@ namespace mxl::lib
                     throw std::invalid_argument{std::move(msg)};
                 }
             }
+        }
+        else if (_format == MXL_DATA_FORMAT_EVENT)
+        {
+            payloadSize = MXL_DATA_FORMAT_GRAIN_SIZE;
         }
         else if (_format == MXL_DATA_FORMAT_AUDIO)
         {
@@ -439,8 +487,7 @@ namespace mxl::lib
                 // Variable-length grain flows use 256-byte slices so totalSlices
                 // (uint16_t) can address up to ~16 MB per grain. Fixed-size data
                 // (e.g. video/smpte291) keeps the original 1-byte slice.
-                auto const it = _root.find("mxl:grain_payload_size");
-                sliceLengths[0] = (it != _root.end() && it->second.is<double>()) ? 256 : 1;
+                sliceLengths[0] = findVariableDataSize(_root) ? 256 : 1;
                 return sliceLengths;
             }
 
@@ -485,7 +532,7 @@ namespace mxl::lib
             {
                 // Variable-length grain flows: total slices = ceil(grain / 256).
                 // Fixed-size data flows keep one slice per grain byte.
-                if (auto const it = _root.find("mxl:grain_payload_size"); it != _root.end() && it->second.is<double>())
+                if (findVariableDataSize(_root))
                 {
                     constexpr auto kSliceSize = std::size_t{256};
                     return (getPayloadSize() + kSliceSize - 1) / kSliceSize;
